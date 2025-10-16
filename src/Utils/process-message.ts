@@ -1,4 +1,3 @@
-import type { AxiosRequestConfig } from 'axios'
 import { proto } from '../../WAProto/index.js'
 import type {
 	AuthenticationCreds,
@@ -9,15 +8,26 @@ import type {
 	ParticipantAction,
 	RequestJoinAction,
 	RequestJoinMethod,
-	SignalKeyStoreWithTransaction
+	SignalKeyStoreWithTransaction,
+	SignalRepositoryWithLIDStore
 } from '../Types'
 import { WAMessageStubType } from '../Types'
 import { getContentType, normalizeMessageContent } from '../Utils/messages'
-import { areJidsSameUser, isJidBroadcast, isJidStatusBroadcast, jidNormalizedUser } from '../WABinary'
+import {
+	areJidsSameUser,
+	isJidBroadcast,
+	isJidHostedLidUser,
+	isJidHostedPnUser,
+	isJidStatusBroadcast,
+	jidDecode,
+	jidEncode,
+	jidNormalizedUser
+} from '../WABinary'
 import { aesDecryptGCM, hmacSign } from './crypto'
 import { toNumber } from './generics'
 import { downloadAndProcessHistorySyncNotification } from './history'
 import type { ILogger } from './logger'
+import { decodeAndHydrate } from './proto-utils'
 
 type ProcessMessageContext = {
 	shouldProcessHistoryMsg: boolean
@@ -26,7 +36,8 @@ type ProcessMessageContext = {
 	keyStore: SignalKeyStoreWithTransaction
 	ev: BaileysEventEmitter
 	logger?: ILogger
-	options: AxiosRequestConfig<{}>
+	options: RequestInit
+	signalRepository: SignalRepositoryWithLIDStore
 }
 
 const REAL_MSG_STUB_TYPES = new Set([
@@ -41,8 +52,24 @@ const REAL_MSG_REQ_ME_STUB_TYPES = new Set([WAMessageStubType.GROUP_PARTICIPANT_
 /** Cleans a received message to further processing */
 export const cleanMessage = (message: proto.IWebMessageInfo, meId: string) => {
 	// ensure remoteJid and participant doesn't have device or agent in it
-	message.key.remoteJid = jidNormalizedUser(message.key.remoteJid!)
-	message.key.participant = message.key.participant ? jidNormalizedUser(message.key.participant) : undefined
+	if (isJidHostedPnUser(message.key.remoteJid!) || isJidHostedLidUser(message.key.remoteJid!)) {
+		message.key.remoteJid = jidEncode(
+			jidDecode(message.key.remoteJid!)?.user!,
+			isJidHostedPnUser(message.key.remoteJid!) ? 's.whatsapp.net' : 'lid'
+		)
+	} else {
+		message.key.remoteJid = jidNormalizedUser(message.key.remoteJid!)
+	}
+
+	if (isJidHostedPnUser(message.key.participant!) || isJidHostedLidUser(message.key.participant!)) {
+		message.key.participant = jidEncode(
+			jidDecode(message.key.participant!)?.user!,
+			isJidHostedPnUser(message.key.participant!) ? 's.whatsapp.net' : 'lid'
+		)
+	} else {
+		message.key.participant = jidNormalizedUser(message.key.participant!)
+	}
+
 	const content = normalizeMessageContent(message.message)
 	// if the message has a reaction, ensure fromMe & remoteJid are from our perspective
 	if (content?.reactionMessage) {
@@ -65,6 +92,7 @@ export const cleanMessage = (message: proto.IWebMessageInfo, meId: string) => {
 					// fromMe automatically becomes false
 					false
 			// set the remoteJid to being the same as the chat the message came from
+			// TODO: investigate inconsistencies
 			msgKey.remoteJid = message.key.remoteJid
 			// set participant of the message
 			msgKey.participant = msgKey.participant || message.key.participant
@@ -145,7 +173,16 @@ export function decryptPollVote(
 
 const processMessage = async (
 	message: proto.IWebMessageInfo,
-	{ shouldProcessHistoryMsg, placeholderResendCache, ev, creds, keyStore, logger, options }: ProcessMessageContext
+	{
+		shouldProcessHistoryMsg,
+		placeholderResendCache,
+		ev,
+		creds,
+		signalRepository,
+		keyStore,
+		logger,
+		options
+	}: ProcessMessageContext
 ) => {
 	const meId = creds.me!.id
 	const { accountSettings } = creds
@@ -225,7 +262,7 @@ const processMessage = async (
 						}
 
 						logger?.info({ newAppStateSyncKeyId, newKeys }, 'injecting new app state sync keys')
-					})
+					}, meId)
 
 					ev.emit('creds.update', { myAppStateKeyId: newAppStateSyncKeyId })
 				} else {
@@ -253,14 +290,14 @@ const processMessage = async (
 			case proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE:
 				const response = protocolMsg.peerDataOperationRequestResponseMessage!
 				if (response) {
-					placeholderResendCache?.del(response.stanzaId!)
+					await placeholderResendCache?.del(response.stanzaId!)
 					// TODO: IMPLEMENT HISTORY SYNC ETC (sticker uploads etc.).
 					const { peerDataOperationResult } = response
 					for (const result of peerDataOperationResult!) {
 						const { placeholderMessageResendResponse: retryResponse } = result
 						//eslint-disable-next-line max-depth
 						if (retryResponse) {
-							const webMessageInfo = proto.WebMessageInfo.decode(retryResponse.webMessageInfoBytes!)
+							const webMessageInfo = decodeAndHydrate(proto.WebMessageInfo, retryResponse.webMessageInfoBytes!)
 							// wait till another upsert event is available, don't want it to be part of the PDO response message
 							setTimeout(() => {
 								ev.emit('messages.upsert', {
@@ -292,6 +329,25 @@ const processMessage = async (
 					}
 				])
 				break
+			case proto.Message.ProtocolMessage.Type.LID_MIGRATION_MAPPING_SYNC:
+				const encodedPayload = protocolMsg.lidMigrationMappingSyncMessage?.encodedMappingPayload!
+				const { pnToLidMappings, chatDbMigrationTimestamp } = decodeAndHydrate(
+					proto.LIDMigrationMappingSyncPayload,
+					encodedPayload
+				)
+				logger?.debug({ pnToLidMappings, chatDbMigrationTimestamp }, 'got lid mappings and chat db migration timestamp')
+				const pairs = []
+				for (const { pn, latestLid, assignedLid } of pnToLidMappings) {
+					const lid = latestLid || assignedLid
+					pairs.push({ lid: `${lid}@lid`, pn: `${pn}@s.whatsapp.net` })
+				}
+
+				await signalRepository.lidMapping.storeLIDPNMappings(pairs)
+				if (pairs.length) {
+					for (const { pn, lid } of pairs) {
+						await signalRepository.migrateSession(pn, lid)
+					}
+				}
 		}
 	} else if (content?.reactionMessage) {
 		const reaction: proto.IReaction = {
